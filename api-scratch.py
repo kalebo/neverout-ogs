@@ -7,6 +7,8 @@
 ## 4. push notification to phone
 ## 5. More complex notifications (e.g., still 10 hours left but getting close to bed time...)
 ### Next actions
+## [ ] make update alert only trigger when it is your turn
+## [ ] handle pagination better
 ##
 
 import arrow
@@ -63,15 +65,27 @@ class Client:
             {"username": username, "password": password},
         )
 
-    def _request(self, url, verb="GET", data=None, **kwargs):
+    def _request(self, url, verb="GET", data=None, retries=3, **kwargs):
         if (
             self.lastreq
             and arrow.now().timestamp - self.lastreq.timestamp <= self.ratelimit
         ):
             # We should be good netizens and limit ourselves unless using the RT API
             time.sleep(self.ratelimit)
-        self.lastreq = arrow.now()
-        return self.s.request(verb, url, data=data, **kwargs)
+        
+        # Adaptive backoff
+        for attempt in range(retries + 1):
+            try:
+                self.lastreq = arrow.now()
+                return self.s.request(verb, url, data=data, **kwargs)
+
+            except Exception as e:
+                # with max retries just give up
+                if attempt == retries:
+                    raise e
+
+                time.sleep(self.ratelimit * attempt)
+        
 
     def get_config(self):
         r = self._request(self.baseurl + "/api/v1/ui/config", "GET")
@@ -87,6 +101,8 @@ class Client:
 
     def curr_game_ids(self):  # WARN: the json result from curr_games may be paginated!
         games = self.curr_games()
+        if games["next"] or games["previous"]:
+            self.log.warning("curr_games returned paginated results!")
         return [i["id"] for i in games["results"]]
 
     def get_game(self, gid):
@@ -121,9 +137,10 @@ class Client:
         self.games.update({gid: self.get_status(gid) for gid in gids})
 
     def alert(self, status):
+        priority = 1 if (status["timeout"].timestamp - time.time() < 12 * 3600) else 0
         self.push(
             f"Your game with {status['opponent']} will end in {status['timeout'].humanize()}!\n{status['url']}",
-            1,
+            priority,
         )
 
     def _setup_ws(self):
@@ -174,11 +191,13 @@ class Client:
         self.log.info("Updating self.games ...")
         self.games = {gid: self.get_status(gid) for gid in self.curr_game_ids()}
 
-    def set_game_timer(self, gid, status, fraction=1/2):
+    def set_game_timer(self, gid, status, fraction=1 / 2):
         delta = (status["timeout"].timestamp - time.time()) * fraction
         task = self.sched.enter(delta, 1, self.notify_task, (gid,))
         self.log.info(
-            "Alert for game {} set to run in {:.1f} seconds at {:.1f}".format(gid, delta, time.time() + delta)
+            "Alert for game {} set to run in {:.0f} seconds at {:.0f}".format(
+                gid, delta, time.time() + delta
+            )
         )
         self._replace_timer(gid, task)
 
@@ -191,21 +210,33 @@ class Client:
                 pass
         self.timers[gid] = task
 
-    def update_task(self, delay=30*60.0):
+    def update_task(self, delay=30 * 60.0):
         self.update_games()
         for gid, status in self.games.items():
             if status["myturn"] and gid not in self.timers:
+                # only set the timer once in update_task. After notify task should handle it
                 self.set_game_timer(gid, status)
-        self.log.info("Next update will occur in {} seconds at {:.1f}".format(delay, time.time() + delay))
+        self.log.info(
+            "Next update will occur in {} seconds at {:.0f}".format(
+                delay, time.time() + delay
+            )
+        )
         self.sched.enter(delay, 1, self.update_task)
 
     def notify_task(self, gid):
-        self.log.info("Checking status of {}...".format(gid))
+        self.log.info("Checking status of game {}...".format(gid))
         status = self.get_status(gid)
+
+        if gid not in self.games:
+            self.log.info("Game {} has ended.".format(gid))
+            self.games.pop(gid, None)
+            return
+
         # only notify if there hasn't been any moves since the timer was set
-        if status["turn"] == self.games[gid]["turn"]:
+        if status["turn"] == self.games[gid]["turn"] and status["myturn"]:
             self.alert(status)
             self.log.info("Alerting!")
+
         self.set_game_timer(gid, status)
         self.games[gid].update(status)
 
@@ -264,4 +295,7 @@ KM[6.5]
 
 if __name__ == "__main__":
     c = Client(config.OGS.user, config.OGS.password)
-    c.run()
+    try:    
+        c.run()
+    except:
+        c.watchdog_alert()
